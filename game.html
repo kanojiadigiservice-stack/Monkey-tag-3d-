@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Monkey Tag 3D</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#87ceeb;font-family:system-ui,sans-serif;}
+  #hud{position:fixed;top:10px;left:50%;transform:translateX(-50%);
+       background:#0007;color:#fff;padding:8px 16px;border-radius:10px;font-size:14px;
+       display:flex;gap:14px;z-index:10;}
+  .it{color:#ff6666;font-weight:700;} .run{color:#66ff99;font-weight:700;}
+  #dash{position:fixed;right:16px;bottom:16px;width:70px;height:70px;border-radius:50%;
+        background:#ffcc33dd;border:none;font-size:13px;font-weight:700;z-index:10;display:none;}
+  #pad{position:fixed;left:16px;bottom:16px;display:none;grid-template-columns:repeat(3,52px);
+       grid-template-rows:repeat(3,52px);gap:4px;z-index:10;}
+  #pad button{border:none;border-radius:10px;background:#0007;color:#fff;font-size:18px;}
+  @media (max-width:800px){ #dash{display:block;} #pad{display:grid;} }
+</style>
+</head>
+<body>
+<div id="hud">
+  <span id="msg">Connecting…</span>
+  <span id="ability">Ability: none</span>
+  <span id="count">Players: 0</span>
+</div>
+<button id="dash">DASH</button>
+<div id="pad">
+  <span></span><button data-k="w">▲</button><span></span>
+  <button data-k="a">◀</button><span></span><button data-k="d">▶</button>
+  <span></span><button data-k="s">▼</button><span></span>
+</div>
+
+<script type="importmap">
+{ "imports": { "three": "https://unpkg.com/three@0.160.0/build/three.module.js" } }
+</script>
+<script src="/socket.io/socket.io.js"></script>
+<script type="module">
+import * as THREE from 'three';
+
+const socket = io({ transports: ['websocket'] });
+const msgEl = document.getElementById('msg');
+const abEl = document.getElementById('ability');
+const countEl = document.getElementById('count');
+
+// ---- Three.js setup ----
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x87ceeb);
+scene.fog = new THREE.Fog(0x87ceeb, 40, 90);
+
+const camera = new THREE.PerspectiveCamera(65, innerWidth/innerHeight, 0.1, 500);
+const lowPower = innerWidth < 800 || navigator.hardwareConcurrency <= 4;
+const renderer = new THREE.WebGLRenderer({ antialias: !lowPower, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(devicePixelRatio, lowPower ? 1 : 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = !lowPower;
+document.body.appendChild(renderer.domElement);
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0x446644, 1.0));
+const sun = new THREE.DirectionalLight(0xffffff, 1.2);
+sun.position.set(20, 30, 10);
+sun.castShadow = true;
+scene.add(sun);
+
+// Ground
+const ground = new THREE.Mesh(
+  new THREE.PlaneGeometry(80, 80),
+  new THREE.MeshStandardMaterial({ color: 0x6fbf5c })
+);
+ground.rotation.x = -Math.PI/2;
+ground.receiveShadow = true;
+scene.add(ground);
+
+// Lobby floor (sand-colored strip, z < -28) + walls with a door gap
+const lobbyFloor = new THREE.Mesh(
+  new THREE.PlaneGeometry(80, 12),
+  new THREE.MeshStandardMaterial({ color: 0xc9a876 })
+);
+lobbyFloor.rotation.x = -Math.PI/2;
+lobbyFloor.position.set(0, 0.01, -34);
+scene.add(lobbyFloor);
+
+function wallSeg(x, w) {
+  const m = new THREE.Mesh(new THREE.BoxGeometry(w, 3, 1), new THREE.MeshStandardMaterial({ color: 0x6b4f2a }));
+  m.position.set(x, 1.5, -28);
+  m.castShadow = true;
+  scene.add(m);
+}
+wallSeg(-22, 36); // left wall segment (leaves door gap -4..4)
+wallSeg(22, 36);  // right wall segment
+
+// ---- Monkey factory ----
+function makeMonkeyMesh(color) {
+  const g = new THREE.Group();
+  const seg = lowPower ? 6 : 8;
+  const body = new THREE.Mesh(
+    new THREE.CapsuleGeometry(0.5, 0.6, 2, seg),
+    new THREE.MeshStandardMaterial({ color })
+  );
+  body.position.y = 0.85;
+  body.castShadow = !lowPower;
+  const head = new THREE.Mesh(
+    new THREE.SphereGeometry(0.4, seg, seg),
+    new THREE.MeshStandardMaterial({ color: 0x6b4226 })
+  );
+  head.position.y = 1.55;
+  head.castShadow = !lowPower;
+  g.add(body, head);
+  g.userData.body = body;
+  return g;
+}
+
+const remoteMeshes = {}; // id -> THREE.Group
+let myId = null;
+let world = { trees: [], blocks: [] };
+const blockMeshes = {};
+const treeMeshes = [];
+
+// local player state (client-predicted)
+const local = { x: 0, y: 0, z: -34, rotY: 0, speed: 6, it: false, ability: null, abilityUntil: 0, dashCd: 0 };
+let localMesh = null;
+
+// ---- Networking ----
+socket.on('init', (data) => {
+  myId = data.id;
+  world = data.world;
+  buildWorldMeshes();
+  for (const id in data.players) {
+    if (id === myId) {
+      const p = data.players[id];
+      local.x = p.x; local.z = p.z; local.it = p.it;
+      localMesh = makeMonkeyMesh(p.color);
+      scene.add(localMesh);
+    } else {
+      addRemote(data.players[id]);
+    }
+  }
+  updateHud();
+});
+
+socket.on('playerJoined', (p) => {
+  if (p.id !== myId && !remoteMeshes[p.id]) addRemote(p);
+  countEl.textContent = 'Players: ' + (Object.keys(remoteMeshes).length + 1);
+});
+
+socket.on('playerLeft', (id) => {
+  if (remoteMeshes[id]) {
+    scene.remove(remoteMeshes[id]);
+    delete remoteMeshes[id];
+  }
+  countEl.textContent = 'Players: ' + (Object.keys(remoteMeshes).length + 1);
+});
+
+socket.on('state', (players) => {
+  countEl.textContent = 'Players: ' + Object.keys(players).length;
+  for (const id in players) {
+    const p = players[id];
+    if (id === myId) {
+      local.it = p.it; // server is authoritative on tag status
+      updateHud();
+      continue;
+    }
+    if (!remoteMeshes[id]) addRemote(p);
+    const mesh = remoteMeshes[id];
+    mesh.userData.target = { x: p.x, z: p.z, rotY: p.rotY };
+    mesh.userData.it = p.it;
+  }
+});
+
+socket.on('tag', ({ newIt, oldIt }) => {
+  if (newIt === myId || oldIt === myId) updateHud();
+});
+
+socket.on('blockTaken', ({ blockId, playerId, ability }) => {
+  const mesh = blockMeshes[blockId];
+  if (mesh) mesh.visible = false;
+  if (playerId === myId) {
+    local.ability = ability;
+    local.abilityUntil = ability === 'speed' ? Date.now() + 6000 : 0;
+    if (ability === 'dash') local.dashCd = 0;
+    updateHud();
+  }
+});
+socket.on('blockRespawn', (blockId) => {
+  const mesh = blockMeshes[blockId];
+  if (mesh) mesh.visible = true;
+});
+
+function addRemote(p) {
+  const mesh = makeMonkeyMesh(p.color);
+  mesh.position.set(p.x, 0, p.z);
+  mesh.userData.target = { x: p.x, z: p.z, rotY: p.rotY };
+  mesh.userData.it = p.it;
+  scene.add(mesh);
+  remoteMeshes[p.id] = mesh;
+}
+
+function buildWorldMeshes() {
+  for (const t of world.trees) {
+    const g = new THREE.Group();
+    const seg = lowPower ? 5 : 8;
+    const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.25, 0.3, 1.6, seg), new THREE.MeshStandardMaterial({ color: 0x7a5230 }));
+    trunk.position.y = 0.8;
+    const leaves = new THREE.Mesh(new THREE.SphereGeometry(1.4, seg, seg), new THREE.MeshStandardMaterial({ color: 0x2f8f3a }));
+    leaves.position.y = 2.1;
+    trunk.castShadow = leaves.castShadow = !lowPower;
+    g.add(trunk, leaves);
+    g.position.set(t.x, 0, t.z);
+    scene.add(g);
+    treeMeshes.push({ x: t.x, z: t.z, r: t.r });
+  }
+  for (const b of world.blocks) {
+    const mesh = new THREE.Mesh(
+      new THREE.BoxGeometry(0.8, 0.8, 0.8),
+      new THREE.MeshStandardMaterial({ color: 0xffd93d, emissive: 0x554400 })
+    );
+    mesh.position.set(b.x, 0.8, b.z);
+    mesh.castShadow = true;
+    scene.add(mesh);
+    blockMeshes[b.id] = mesh;
+  }
+}
+
+function hitsTree(x, z, r) {
+  for (const t of treeMeshes) {
+    if (Math.hypot(x - t.x, z - t.z) < r + t.r) return true;
+  }
+  return false;
+}
+function hitsWall(x, z, r) {
+  if (z < -28 + r && z > -28 - r) {
+    if (x < -4 - r || x > 4 + r) return true;
+  }
+  return false;
+}
+
+function updateHud() {
+  msgEl.innerHTML = local.it
+    ? '<span class="it">You are IT — catch someone!</span>'
+    : '<span class="run">RUN! Avoid the glowing red monkey.</span>';
+  abEl.textContent = 'Ability: ' + (local.ability ? (local.ability === 'speed' ? 'Speed boost' : 'Dash (Space)') : 'none');
+}
+
+// ---- Input ----
+const keys = {};
+addEventListener('keydown', e => { keys[e.key.toLowerCase()] = true; if (e.key === ' ') tryDash(); });
+addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
+document.querySelectorAll('#pad button').forEach(b => {
+  const k = b.dataset.k;
+  b.addEventListener('touchstart', e => { e.preventDefault(); keys[k] = true; });
+  b.addEventListener('touchend', e => { e.preventDefault(); keys[k] = false; });
+});
+document.getElementById('dash').addEventListener('click', tryDash);
+
+function tryDash() {
+  if (local.ability === 'dash' && local.dashCd <= 0) {
+    const nx = local.x + Math.sin(local.rotY) * 6;
+    const nz = local.z - Math.cos(local.rotY) * 6;
+    if (!hitsTree(nx, nz, 0.5) && !hitsWall(nx, nz, 0.5)) {
+      local.x = nx; local.z = nz;
+    }
+    local.dashCd = 180;
+  }
+}
+
+// ---- Loop ----
+let lastSend = 0;
+function animate() {
+  requestAnimationFrame(animate);
+  const dt = 1/60;
+
+  let dx = 0, dz = 0;
+  if (keys['w'] || keys['arrowup']) dz -= 1;
+  if (keys['s'] || keys['arrowdown']) dz += 1;
+  if (keys['a'] || keys['arrowleft']) dx -= 1;
+  if (keys['d'] || keys['arrowright']) dx += 1;
+  if (dx || dz) {
+    const len = Math.hypot(dx, dz); dx /= len; dz /= len;
+    local.rotY = Math.atan2(dx, -dz);
+    const spd = local.speed * (local.ability === 'speed' && Date.now() < local.abilityUntil ? 1.7 : 1);
+    const nx = local.x + dx * spd * dt;
+    const nz = local.z + dz * spd * dt;
+    if (!hitsTree(nx, local.z, 0.5) && !hitsWall(nx, local.z, 0.5)) local.x = Math.max(-40, Math.min(40, nx));
+    if (!hitsTree(local.x, nz, 0.5) && !hitsWall(local.x, nz, 0.5)) local.z = Math.max(-40, Math.min(40, nz));
+  }
+  if (local.ability === 'speed' && Date.now() > local.abilityUntil) { local.ability = null; updateHud(); }
+  if (local.dashCd > 0) local.dashCd--;
+
+  if (localMesh) {
+    localMesh.position.set(local.x, 0, local.z);
+    localMesh.rotation.y = local.rotY;
+    localMesh.userData.body.material.emissive = new THREE.Color(local.it ? 0x660000 : 0x000000);
+  }
+
+  // check lucky block collision
+  for (const id in blockMeshes) {
+    const m = blockMeshes[id];
+    if (m.visible && Math.hypot(local.x - m.position.x, local.z - m.position.z) < 1.1) {
+      socket.emit('collectBlock', id);
+    }
+  }
+
+  // send position ~15x/sec
+  const now = performance.now();
+  if (now - lastSend > 40) {
+    socket.emit('move', { x: local.x, y: 0, z: local.z, rotY: local.rotY });
+    lastSend = now;
+  }
+
+  // interpolate remote players
+  for (const id in remoteMeshes) {
+    const mesh = remoteMeshes[id];
+    const t = mesh.userData.target;
+    if (t) {
+      mesh.position.x += (t.x - mesh.position.x) * 0.4;
+      mesh.position.z += (t.z - mesh.position.z) * 0.4;
+      mesh.rotation.y = t.rotY;
+    }
+    mesh.userData.body.material.emissive = new THREE.Color(mesh.userData.it ? 0x660000 : 0x000000);
+  }
+
+  // third-person camera follow
+  const camDist = 9, camHeight = 5;
+  camera.position.x += (local.x - Math.sin(local.rotY) * camDist - camera.position.x) * 0.1;
+  camera.position.z += (local.z + Math.cos(local.rotY) * camDist - camera.position.z) * 0.1;
+  camera.position.y += (camHeight - camera.position.y) * 0.1;
+  camera.lookAt(local.x, 1, local.z);
+
+  renderer.render(scene, camera);
+}
+animate();
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>

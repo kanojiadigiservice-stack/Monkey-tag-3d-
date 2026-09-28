@@ -1,0 +1,158 @@
+// server.js — authoritative Monkey Tag server
+// Run locally:  npm install && npm start
+// Deploy: Render / Railway / Fly.io / any Node host. Serves the client too.
+
+const path = require('path');
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: { origin: '*' },
+  transports: ['websocket'], // skip polling fallback, connect straight to a real socket
+  pingInterval: 10000,
+  pingTimeout: 5000
+});
+
+// Serve the 3D client as static files (single deploy = server + client)
+app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'game.html')));
+
+const PORT = process.env.PORT || 3000;
+const TICK_HZ = 30;
+const TAG_RADIUS = 1.6;
+const IMMUNITY_MS = 1200;
+const WORLD_HALF = 40; // ground is 80x80, centered at origin
+const LOBBY_Z_MAX = -28; // lobby occupies z < -28, door gap on x
+const DOOR_X1 = -4, DOOR_X2 = 4;
+
+// ---- World objects (generated once, shared by everyone) ----
+function makeWorld() {
+  const trees = [];
+  for (let i = 0; i < 14; i++) {
+    let x, z;
+    do {
+      x = (Math.random() * 2 - 1) * (WORLD_HALF - 6);
+      z = -20 + Math.random() * (WORLD_HALF + 20 - 6);
+    } while (Math.abs(x) < 6 && z < LOBBY_Z_MAX + 8); // keep door clear
+    trees.push({ x, z, r: 1.4 });
+  }
+  const blocks = [];
+  for (let i = 0; i < 8; i++) {
+    blocks.push({
+      id: 'b' + i,
+      x: (Math.random() * 2 - 1) * (WORLD_HALF - 6),
+      z: -18 + Math.random() * (WORLD_HALF + 18 - 6),
+      active: true
+    });
+  }
+  return { trees, blocks };
+}
+
+// ---- Game state ----
+const world = makeWorld();
+const players = {}; // socketId -> {id,name,x,y,z,rotY,color,it,immuneUntil,ability,abilityUntil}
+const COLORS = ['#ff9f43', '#a55eea', '#26de81', '#eb3b5a', '#2bcbba', '#4da3ff', '#feca57', '#54a0ff'];
+let colorIdx = 0;
+
+function spawnPoint() {
+  // spawn inside the lobby (z < LOBBY_Z_MAX)
+  return {
+    x: (Math.random() * 2 - 1) * (WORLD_HALF - 8),
+    y: 0,
+    z: -34 + Math.random() * 4
+  };
+}
+
+function pickInitialIt() {
+  const ids = Object.keys(players);
+  if (!ids.length) return;
+  if (!ids.some(id => players[id].it)) {
+    const id = ids[Math.floor(Math.random() * ids.length)];
+    players[id].it = true;
+  }
+}
+
+io.on('connection', (socket) => {
+  const spawn = spawnPoint();
+  players[socket.id] = {
+    id: socket.id,
+    name: 'Monkey' + socket.id.slice(0, 4),
+    x: spawn.x, y: spawn.y, z: spawn.z,
+    rotY: 0,
+    color: COLORS[colorIdx++ % COLORS.length],
+    it: false,
+    immuneUntil: 0,
+    ability: null,
+    abilityUntil: 0
+  };
+  pickInitialIt();
+
+  // Send this player their id + the full world + current roster
+  socket.emit('init', {
+    id: socket.id,
+    world,
+    players
+  });
+
+  socket.broadcast.emit('playerJoined', players[socket.id]);
+
+  socket.on('move', (data) => {
+    const p = players[socket.id];
+    if (!p || typeof data.x !== 'number' || typeof data.z !== 'number') return;
+    // clamp to world bounds server-side (basic anti-cheat)
+    p.x = Math.max(-WORLD_HALF, Math.min(WORLD_HALF, data.x));
+    p.z = Math.max(-WORLD_HALF, Math.min(WORLD_HALF, data.z));
+    p.y = Math.max(0, Math.min(3, data.y || 0));
+    p.rotY = data.rotY || 0;
+
+    // tag check: if this player is IT and not immune, check distance to everyone
+    if (p.it && Date.now() > p.immuneUntil) {
+      for (const otherId in players) {
+        if (otherId === socket.id) continue;
+        const o = players[otherId];
+        if (Date.now() < o.immuneUntil) continue;
+        const dx = o.x - p.x, dz = o.z - p.z;
+        if (Math.hypot(dx, dz) < TAG_RADIUS) {
+          p.it = false;
+          p.immuneUntil = Date.now() + IMMUNITY_MS;
+          o.it = true;
+          o.immuneUntil = Date.now() + IMMUNITY_MS;
+          io.emit('tag', { newIt: otherId, oldIt: socket.id });
+          break;
+        }
+      }
+    }
+  });
+
+  socket.on('collectBlock', (blockId) => {
+    const block = world.blocks.find(b => b.id === blockId);
+    const p = players[socket.id];
+    if (!block || !block.active || !p) return;
+    block.active = false;
+    const ability = Math.random() < 0.5 ? 'speed' : 'dash';
+    p.ability = ability;
+    p.abilityUntil = ability === 'speed' ? Date.now() + 6000 : Date.now() + 1;
+    io.emit('blockTaken', { blockId, playerId: socket.id, ability });
+    setTimeout(() => {
+      block.active = true;
+      io.emit('blockRespawn', blockId);
+    }, 5000);
+  });
+
+  socket.on('disconnect', () => {
+    delete players[socket.id];
+    io.emit('playerLeft', socket.id);
+    pickInitialIt();
+  });
+});
+
+// Broadcast full state at fixed tick rate (cheap + simple; fine for small rooms)
+setInterval(() => {
+  io.emit('state', players);
+}, 1000 / TICK_HZ);
+
+server.listen(PORT, () => {
+  console.log(`Monkey Tag server running on port ${PORT}`);
+});
